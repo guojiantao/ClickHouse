@@ -3,7 +3,7 @@
 #include <errno.h>
 #include "syscall.h"
 
-int eventfd(unsigned int count, int flags)
+int eventfd(int count, int flags)
 {
 	int r = __syscall(SYS_eventfd2, count, flags);
 #ifdef SYS_eventfd
