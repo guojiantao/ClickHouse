@@ -12,6 +12,7 @@ void registerFunctionsStringArray(FunctionFactory & factory)
     factory.registerFunction<FunctionSplitByChar>();
     factory.registerFunction<FunctionSplitByString>();
     factory.registerFunction<FunctionArrayStringConcat>();
+    factory.registerFunction<FunctionMultiplyArrayStringConcat>();
 }
 
 }

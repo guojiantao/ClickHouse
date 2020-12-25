@@ -13,7 +13,10 @@
 #include <Functions/Regexps.h>
 #include <Functions/FunctionHelpers.h>
 #include <IO/WriteHelpers.h>
-
+#include <ext/range.h>
+#include <iostream>
+#include <common/iostream_debug_helpers.h>
+#include <Core/Types.h>
 
 namespace DB
 {
@@ -575,6 +578,232 @@ public:
 
             return col_res;
         }
+    }
+};
+
+
+/// Joins multiply arrays of strings into one string via a separator.
+struct multiplyArrayStringConcatImpl
+{
+    static void constMultiplyArrayStringConcat(
+        const ColumnsWithTypeAndName & arguments,
+        size_t begin,
+        size_t end,
+        const char * delimiter, const size_t delimiter_size,
+        ColumnString::Chars & dst_chars,
+        ColumnString::Offsets & dst_string_offsets)
+    {
+        std::vector<const ColumnString::Chars *> src_chars(end - begin + 1);
+        std::vector<const ColumnString::Offsets *> src_string_offsets(end - begin + 1);
+        std::vector<const ColumnArray::Offsets *> src_array_offsets(end - begin + 1);
+        size_t total_size = 0;
+        for (size_t i = begin; i <= end; i++)
+        {
+            const ColumnArray & col_arr = assert_cast<const ColumnArray &>(*arguments[i].column);
+            const ColumnString & col_string = assert_cast<const ColumnString &>(col_arr.getData());
+            src_chars[i] = &col_string.getChars();
+            src_string_offsets[i] = &col_string.getOffsets();
+            src_array_offsets[i] = &col_arr.getOffsets();
+            total_size += (src_chars[i]->size()                                     /// data's size
+                        + src_string_offsets[i]->size() * delimiter_size            /// delimiter's size
+                        - src_string_offsets[i]->size());                           /// zero byte after every string
+        }
+        total_size += src_array_offsets[begin]->size() - delimiter_size * src_array_offsets[begin]->size(); /// zero byte after every array and minus last delimiter
+        dst_chars.resize(total_size);
+        dst_string_offsets.resize(src_array_offsets[begin]->size());
+
+        ColumnArray::Offset current_src_array_offset = 0;
+        ColumnString::Offset current_src_string_offset = 0;
+        ColumnString::Offset current_dst_string_offset = 0;
+
+        for(size_t i = 0; i < src_array_offsets[begin]->size(); ++i)
+        {
+            for(size_t j = begin; j <= end; ++j)
+            {
+                if(i != 0)
+                {
+                    current_src_array_offset = (*src_array_offsets[j])[i-1];
+                    current_src_string_offset = (*src_string_offsets[j])[current_src_array_offset - 1];
+                }
+                else
+                {
+                    current_src_array_offset = 0;
+                    current_src_string_offset = 0;
+                }
+                
+                for(auto next_src_array_offset = (*src_array_offsets[j])[i]; current_src_array_offset < next_src_array_offset; ++current_src_array_offset)
+                {
+                    size_t byte_to_copy = (*src_string_offsets[j])[current_src_array_offset] - current_src_string_offset - 1;
+                    memcpySmallAllowReadWriteOverflow15(
+                        &dst_chars[current_dst_string_offset], &(*src_chars[j])[current_src_string_offset], byte_to_copy);
+                    current_dst_string_offset += byte_to_copy;
+                    current_src_string_offset = (*src_string_offsets[j])[current_src_array_offset];
+                    if(j == end && current_src_array_offset + 1 == next_src_array_offset)
+                    {
+                        dst_chars[current_dst_string_offset] = 0;
+                        ++current_dst_string_offset;
+                        dst_string_offsets[i] = current_dst_string_offset;
+                    }
+                    else
+                    {
+                        memcpy(&dst_chars[current_dst_string_offset], delimiter, delimiter_size);
+                        current_dst_string_offset += delimiter_size;                        
+                    }
+                }
+            }
+        }
+    }
+    /*
+    static void constAllMultiplyArrayStringConcat(
+        const ColumnsWithTypeAndName & arguments,
+        size_t begin,
+        size_t end,
+        const char * delimiter, const size_t delimiter_size,
+        ColumnString::Chars & dst_chars,
+        ColumnString::Offsets & dst_string_offsets)
+    {
+        Array src_arr = col_const_arr->getValue<Array>();
+        String dst_str;
+        for (size_t i = 0, size = src_arr.size(); i < size; ++i)
+        {
+            if (i != 0)
+                dst_str += delimiter;
+            dst_str += src_arr[i].get<const String &>();
+        }        
+    }
+    */
+};
+
+class FunctionMultiplyArrayStringConcat : public IFunction
+{
+    template<typename T>
+    bool allT(const ColumnsWithTypeAndName & arguments, size_t begin, size_t end) const
+    {
+        bool all = true;
+        for(size_t i = begin; i < end; ++i)
+        {
+            const ColumnPtr _innerCol = arguments[i].column;
+            if(!checkColumn<T>(_innerCol.get()))
+            {
+                all = false;
+                break;
+            }
+        }
+        return all;
+    }
+public:
+    static constexpr auto name = "multiplyArrayStringConcat";
+    static FunctionPtr create(const Context &) { return std::make_shared<FunctionMultiplyArrayStringConcat>(); }
+
+    String getName() const override
+    {
+        return name;
+    }
+
+    bool isVariadic() const override { return true; }
+    // bool useDefaultImplementationForConstants() const override { return true; }
+    size_t getNumberOfArguments() const override { return 0; }
+    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+    {
+        if (arguments.empty())
+            throw Exception{"Function " + getName() + " requires at least one argument.", ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH};
+        else if(arguments.size() == 1)
+        {
+            const DataTypeArray * array_type = checkAndGetDataType<DataTypeArray>(arguments[0].get());
+            if (!array_type || !isString(array_type->getNestedType()))
+                throw Exception("First argument for function " + getName() + " must be array of strings.", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+        }
+        else
+        {
+            for(size_t i = 0; i < arguments.size() - 1; ++i)
+            {
+                const DataTypeArray * array_type = checkAndGetDataType<DataTypeArray>(arguments[i].get());
+                if (!array_type || !isString(array_type->getNestedType()))
+                    throw Exception("The first few arguments for function " + getName() + " must be array of strings.", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+            }
+            size_t last_index = arguments.size() - 1;
+            const DataTypeArray * array_type = checkAndGetDataType<DataTypeArray>(arguments[last_index].get());
+            if ( !isString(arguments[last_index]) && (!array_type || !isString(array_type->getNestedType())))
+                throw Exception("The last argument for function " + getName() + " must be constant string or array of string.", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+        }
+        return std::make_shared<DataTypeString>();
+    }
+
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t /*input_rows_count*/) const override
+    {
+        String delimiter;
+        int last_index = arguments.size() - 1;
+        const ColumnPtr column = arguments[last_index].column;
+        if(checkAndGetColumn<ColumnArray>(column.get()))        /// if last column is array, every column before it must be column array
+        {
+            bool allArrayColumn = allT<ColumnArray>(arguments, 0, arguments.size() - 1);
+            if(allArrayColumn)
+            {
+                auto col_res = ColumnString::create();
+                multiplyArrayStringConcatImpl::constMultiplyArrayStringConcat(arguments, 0, arguments.size()-1, delimiter.data(), delimiter.size(), col_res->getChars(), col_res->getOffsets());
+                return col_res;
+            }
+        }
+        else if(checkColumn<ColumnConst>(column.get()))     /// if last column is const,
+        {
+            const ColumnConst * colCon = checkAndGetColumn<ColumnConst>(column.get());
+            bool allArrayColumns = allT<ColumnArray>(arguments, 0, arguments.size()-2);
+            bool allArrayConst = allT<ColumnConst>(arguments, 0, arguments.size()-2);
+
+            if(colCon->getDataType() == TypeIndex::String)
+            {
+                if(allArrayColumns)
+                {
+                    delimiter = colCon->getValue<String>();
+                    auto col_res = ColumnString::create();
+                    multiplyArrayStringConcatImpl::constMultiplyArrayStringConcat(arguments, 0, arguments.size()-2, delimiter.data(), delimiter.size(), col_res->getChars(), col_res->getOffsets());
+                    return col_res;
+                }
+                else if(allArrayConst)
+                {
+                    delimiter = colCon->getValue<String>();
+                    String dst_str;
+                    size_t total = 0;
+                    for(size_t i = 0; i < arguments.size()-1; ++i)
+                    {
+                        const ColumnConst * tmpConst = checkAndGetColumn<ColumnConst>(arguments[i].column.get());
+                        Array src_arr = tmpConst->getValue<Array>();
+                        total += tmpConst->size();
+                        for(size_t j = 0; j < src_arr.size(); ++j)
+                        {
+                            if(i != 0 && j != 0)
+                            {
+                                dst_str += delimiter;
+                                total += delimiter.size();
+                            }
+                            dst_str += src_arr[i].get<const String &>();
+                        }
+                    }                 
+                    auto col_res = result_type->createColumnConst(total, dst_str);
+                    return col_res;                     
+                }
+            }
+            else if(colCon->getDataType() == TypeIndex::Array && allArrayConst)
+            {   
+                String dst_str;
+                size_t total = 0;
+                for(size_t i = 0; i < arguments.size(); ++i)
+                {
+                    const ColumnConst * tmpConst = checkAndGetColumn<ColumnConst>(arguments[i].column.get());
+                    Array src_arr = tmpConst->getValue<Array>();
+                    total += tmpConst->size();
+                    for(size_t j = 0; j < src_arr.size(); ++j)
+                    {
+                        dst_str += src_arr[i].get<const String &>();
+                    }
+                }                 
+                auto col_res = result_type->createColumnConst(total, dst_str);
+                return col_res;    
+            }
+        }
+        throw Exception(
+            "Illegal column " + arguments[last_index].column->getName() + " of argument of function " + getName(),
+            ErrorCodes::ILLEGAL_COLUMN);   
     }
 };
 
